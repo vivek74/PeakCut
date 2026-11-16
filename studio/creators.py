@@ -19,7 +19,7 @@ DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "min
             "plan": "free", "decide_mode": "both", "must_clip_min": 0, "min_gap_min": 2,
             "trigger_words": "clip that, clip it",
             "autopost": False, "accounts": [], "post_min_score": 75, "post_gap_min": 45, "daily_cap": 6,
-            "privacy": "public", "post_footer": "", "rate_per_1k": 0.0, "channels": {}}
+            "privacy": "public", "post_footer": "", "watermark": "", "watermark_pos": "bottom", "rate_per_1k": 0.0, "channels": {}}
 PLATFORMS = ("youtube", "twitch", "kick")
 
 
@@ -73,6 +73,10 @@ def _clean(data: dict) -> dict:
             v = v if v in ("both", "either") else "both"
         elif k == "privacy":
             v = v if v in ("public", "unlisted", "private") else "public"
+        elif k == "watermark_pos":
+            v = v if v in ("bottom", "top") else "bottom"
+        elif k == "watermark":
+            v = re.sub(r"[\x00-\x1f\x7f{}\\]", "", str(v)).strip()[:60]   # one short line; no caption-format codes
         else:
             v = str(v).strip()[:300]
         out[k] = v

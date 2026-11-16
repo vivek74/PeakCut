@@ -19,6 +19,7 @@ STYLES = {
     "clean": {"label": "Clean", "font": "Poppins ExtraBold", "size": 100, "base": "FFFFFF", "active": "6BD7FF",
               "strong": "FFFFFF", "outline": 5, "pop": 106, "upper": False, "per": 4},
 }
+MARK = {"font": "Poppins ExtraBold", "size": 58, "ink": "FFFFFF", "alpha": "40", "outline": 4, "margin": 120}
 HOOK = {"font": "Poppins ExtraBold", "size": 96, "ink": "14100E", "box": "FFFFFF", "pad_x": 36, "pad_y": 22, "radius": 26,
         "max_w": 900}
 FONT_FILES = {"Poppins ExtraBold": "Poppins-ExtraBold.ttf", "Anton": "Anton-Regular.ttf", "Archivo Black": "ArchivoBlack-Regular.ttf"}
@@ -155,7 +156,7 @@ def _hook_events(hook, dur, y):
     return ev
 
 
-def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y) -> str:
+def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y, watermark="", watermark_pos="bottom") -> str:
     st = STYLES.get(style_name, STYLES["bounce"])
     words = [dict(w, s=w["s"] - CAPTION_LEAD, e=w["e"] - CAPTION_LEAD) for w in words]
     strong = {_key(h) for h in highlight if _key(h)}
@@ -170,12 +171,21 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Cap,{st['font']},{st['size']},&H00{st['base']},&H00{st['base']},&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{st['outline']},0,5,0,0,0,1
 Style: Hook,{HOOK['font']},{HOOK['size']},&H00{HOOK['ink']},&H00{HOOK['ink']},&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
+Style: Mark,{MARK['font']},{MARK['size']},&H{MARK['alpha']}{MARK['ink']},&H{MARK['alpha']}{MARK['ink']},&H{MARK['alpha']}000000,&H00000000,0,0,0,0,100,100,0,0,1,{MARK['outline']},0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     dur = end - start
     ev = _hook_events(_clean(hook), dur, hook_y)
+    mark = _clean(watermark)[:60]
+    if mark:
+        # The credit many clipping campaigns require (for example "@streamer"): the whole clip, slightly see-through,
+        # at the very top or bottom so it never covers the hook or the captions.
+        fm = _Font.get(MARK["font"])
+        size = MARK["size"] if fm.width(mark, MARK["size"]) <= CAP_MAX_W else max(30, int(MARK["size"] * CAP_MAX_W / fm.width(mark, MARK["size"])))
+        y = MARK["margin"] if watermark_pos == "top" else H - MARK["margin"]
+        ev.append(f"Dialogue: 5,{_ts(0)},{_ts(dur)},Mark,,0,0,0,,{{\\an5\\pos({W // 2},{y})\\fs{size}}}{mark}")
     f = _Font.get(st["font"])
     inside = [dict(w, w=_clean(w["w"])) for w in words if w["s"] >= start - 0.05 and w["s"] < end]
     inside = sorted((w for w in inside if w["w"]), key=lambda w: w["s"])
@@ -237,7 +247,7 @@ def _filter(layout, fg_h):
             f"[bg][fg]overlay=0:(H-h)/2,setsar=1[v0];")
 
 
-_qsv_ok = None
+_hw_ok = {}      # encoder -> True / False once tried: a graphics card's encoder is tried first, then the processor
 RENDER_SECONDS = 600      # one clip's video encode; far beyond normal, so a frozen encoder is stopped, not waited on
 
 
@@ -247,7 +257,7 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     start, end = clip["start"], clip["end"]
     layout, fg_h, hook_y, cap_y = geometry(src_w, src_h, clip.get("layout", "blur"))
     ass = build_ass(words, start, end, clip.get("hook", ""), clip.get("style", "bounce"),
-                    clip.get("highlight_words", []), hook_y, cap_y)
+                    clip.get("highlight_words", []), hook_y, cap_y, clip.get("watermark", ""), clip.get("watermark_pos", "bottom"))
     # The clip is made in a short work folder and moved into place afterwards. The caption step of ffmpeg cannot
     # open files whose full path is longer than 260 characters on Windows, which a data folder deep inside other
     # folders easily reaches. Inside the work folder every name is short and relative (a drive colon would also
@@ -260,7 +270,6 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
 
 
 def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str) -> dict:
-    global _qsv_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
@@ -270,7 +279,9 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]
     encoders = []
-    if _qsv_ok is not False:
+    if _hw_ok.get("nvenc") is not False:      # NVIDIA graphics cards: several times faster than the processor
+        encoders.append(("nvenc", ["yuv420p", "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"]))
+    if _hw_ok.get("qsv") is not False:        # Intel graphics
         encoders.append(("qsv", ["nv12", "-c:v", "h264_qsv", "-global_quality", "23", "-preset", "fast"]))
     encoders.append(("x264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"]))
     err = None
@@ -278,12 +289,12 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
         p = subprocess.run(base + enc + [f"{name}.mp4"], cwd=work, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=RENDER_SECONDS)
         if p.returncode == 0:
-            if label == "qsv":
-                _qsv_ok = True
+            if label != "x264":
+                _hw_ok[label] = True
             break
         err = p.stderr[-1200:]
-        if label == "qsv":
-            _qsv_ok = False
+        if label != "x264":
+            _hw_ok[label] = False
     else:
         raise RuntimeError(f"Render failed: {err}")
     cover_t = min(1.2, (end - start) / 2)

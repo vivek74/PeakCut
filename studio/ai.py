@@ -27,9 +27,13 @@ PROVIDERS = {
     "anthropic": ("Claude", "https://api.anthropic.com/v1", "anthropic", "https://console.anthropic.com", ""),
     "ollama": ("Ollama (on this machine)", "http://127.0.0.1:11434/v1", "openai", "https://ollama.com", "llama3.1"),
     "custom": ("Custom (OpenAI-compatible)", "", "openai", "", ""),
+    # Uses the Claude Code app already signed in on this machine (your Claude subscription), so no key is needed.
+    # Install it from https://claude.com/claude-code and sign in once by running `claude` in a terminal.
+    "claude_code": ("Claude Code (your subscription)", "claude-code-cli", "claude_code", "https://claude.com/claude-code", "haiku"),
 }
-ALIASES = {"google": "gemini", "grok": "xai", "claude": "anthropic", "local": "ollama"}
-NO_KEY = {"ollama", "custom"}       # a model running on your own machine needs no key
+ALIASES = {"google": "gemini", "grok": "xai", "claude": "anthropic", "local": "ollama", "claude-code": "claude_code"}
+NO_KEY = {"ollama", "custom", "claude_code"}       # a model on your own machine, or an app already signed in, needs no key
+CLAUDE_CODE_MODELS = ["haiku", "sonnet", "opus"]
 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
@@ -144,6 +148,9 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     p = ALIASES.get(str(provider_id or c["provider"]).lower(), str(provider_id or c["provider"]).lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
+    if p == "claude_code":
+        _claude_bin()                   # says plainly if Claude Code is not installed
+        return list(CLAUDE_CODE_MODELS)
     k = str(with_key or "").strip() or (c["key"] if c["provider"] == p else "")
     base = str(address or "").strip().rstrip("/") or (c["base_url"] if c["provider"] == p else "") or PROVIDERS[p][1]
     if not base:
@@ -248,7 +255,7 @@ def _parse(text):
 def call(model: str, prompt: str, schema: dict):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back)."""
     how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema)
+    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic, "claude_code": _claude_code}[how](model, prompt, schema)
 
 
 def _gemini(model, prompt, schema):
@@ -291,3 +298,46 @@ def _anthropic(model, prompt, schema):
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     u = data.get("usage") or {}
     return _parse(text), int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
+
+
+# ---------------------------------------------------------------- Claude Code, with your Claude subscription
+def _claude_bin() -> str:
+    import shutil
+    found = shutil.which("claude")
+    if not found:
+        raise AIError("Claude Code is not installed on this machine, or not on the PATH. Install it from "
+                      "https://claude.com/claude-code, run `claude` once in a terminal to sign in, then restart PeakCut.")
+    return found
+
+
+def _claude_code(model, prompt, schema):
+    """Ask the Claude Code app on this machine, in its non-interactive mode. It answers with your Claude
+    subscription, so there is no key and no separate bill; its usage limits apply instead.
+    Claude gets no tools here: it can only read the prompt and write the JSON answer."""
+    import subprocess
+    import tempfile
+
+    wrapper = {"type": "object", "properties": {"items": _json_schema(schema)}, "required": ["items"]}
+    cmd = [_claude_bin(), "-p", "--output-format", "json", "--tools", "", "--no-session-persistence",
+           "--strict-mcp-config", "--model", model, "--json-schema", json.dumps(wrapper)]
+    try:
+        # The prompt goes in through stdin: long transcripts are too big for a Windows command line.
+        # It runs from the temp folder so no project settings or CLAUDE.md files are picked up.
+        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=600,
+                           cwd=tempfile.gettempdir(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        raise AIError("Claude Code timed out after 10 minutes.")
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        raise AIError(f"Claude Code did not answer: {(p.stderr or p.stdout)[:300]}")
+    if p.returncode != 0 or data.get("is_error"):
+        text = str(data.get("result") or p.stderr)[:300]
+        if "limit" in text.lower():
+            raise AIError(f"HTTP 429 Claude Code usage limit reached: {text}")
+        raise AIError(f"Claude Code failed: {text}")
+    out = data.get("structured_output")
+    out = out["items"] if isinstance(out, dict) and "items" in out else _parse(data.get("result"))
+    u = data.get("usage") or {}
+    sent = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+    return out, sent, int(u.get("output_tokens") or 0)
